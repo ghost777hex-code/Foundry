@@ -1,0 +1,27 @@
+{
+  "name": "foundry",
+  "version": "1.0.0",
+  "description": "Smart-contract workspace built on [Foundry](https://book.getfoundry.sh/): `forge` (build/test), `cast` (chain CLI), `anvil` (local node), `chisel` (REPL).",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@ghost:ghost777hex-code/Foundry.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@uniswap/v2-core": "1.0.1",
+    "@uniswap/v2-periphery": "1.1.0-beta.0",
+    "@uniswap/v3-core": "1.0.1",
+    "@uniswap/v3-periphery": "1.4.4"
+  }
+}

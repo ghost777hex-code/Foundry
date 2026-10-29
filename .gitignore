@@ -18,3 +18,6 @@ docs/
 .env
 .env.*
 !.env.example
+
+# npm (Uniswap v2/v3 official bytecode)
+node_modules/
