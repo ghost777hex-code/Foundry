@@ -38,13 +38,10 @@ quote_style = "double"
 number_underscore = "thousands"
 sort_imports = true
 
+# Aliases for --rpc-url and vm.createSelectFork("<alias>")
 [rpc_endpoints]
-mainnet = "${MAINNET_RPC_URL}"
-sepolia = "${SEPOLIA_RPC_URL}"
+# Fork tests (test/fork/). Public node without archive state: only recent blocks can be forked.
+mainnet = "https://ethereum-rpc.publicnode.com"
 localhost = "http://127.0.0.1:8545"
-
-[etherscan]
-mainnet = { key = "${ETHERSCAN_API_KEY}" }
-sepolia = { key = "${ETHERSCAN_API_KEY}" }
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

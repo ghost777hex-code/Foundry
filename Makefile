@@ -1,6 +1,6 @@
 -include .env
 
-.PHONY: all install build test test-ci coverage snapshot fmt fmt-check clean anvil deploy-uniswap-local
+.PHONY: all install build test test-ci test-fork coverage snapshot fmt fmt-check clean anvil deploy-uniswap-local
 
 all: build test
 
@@ -16,6 +16,10 @@ test:
 
 test-ci:
 	FOUNDRY_PROFILE=ci forge test -vvv
+
+# Mainnet fork tests; RPC URL is the `mainnet` alias in foundry.toml
+test-fork:
+	forge test --match-path "test/fork/*" -vvv
 
 coverage:
 	forge coverage --report summary

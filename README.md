@@ -8,7 +8,6 @@ Smart-contract workspace built on [Foundry](https://book.getfoundry.sh/): `forge
 curl -L https://foundry.paradigm.xyz | bash && foundryup   # install toolchain
 git clone --recursive <repo> && cd <repo>
 make install                                                # forge install + npm ci
-cp .env.example .env                                        # fill RPC URLs / Etherscan key
 ```
 
 ## Layout
@@ -21,7 +20,8 @@ cp .env.example .env                                        # fill RPC URLs / Et
 | `script/` | Deploy scripts (`*.s.sol`) |
 | `lib/` | Dependencies (git submodules: `forge-std`, OpenZeppelin 4.9.6, Uniswap `v3-core`/`v3-periphery` `0.8` branches) |
 | `node_modules/@uniswap/` | Official Uniswap npm packages (mainnet bytecode, v2 interfaces) |
-| `foundry.toml` | Compiler, fuzz, fmt, RPC and Etherscan config |
+| `test/fork/` | Mainnet fork tests against the live Uniswap v2/v3 contracts |
+| `foundry.toml` | Compiler, fuzz, fmt and RPC config |
 
 ## Commands
 
@@ -31,6 +31,7 @@ cp .env.example .env                                        # fill RPC URLs / Et
 | `build` | Compile and print contract sizes |
 | `test` | Run tests (256 fuzz runs) |
 | `test-ci` | Run tests with the `ci` profile (10k fuzz runs) |
+| `test-fork` | Run only the mainnet fork tests (needs network) |
 | `coverage` / `snapshot` | Coverage summary / gas snapshot |
 | `fmt` / `fmt-check` | Format / verify formatting |
 | `anvil` | Start a local node on `127.0.0.1:8545` |
@@ -60,5 +61,5 @@ Use an encrypted keystore instead of putting a private key in `.env`:
 
 ```sh
 cast wallet import deployer --interactive
-forge script script/<Script>.s.sol --rpc-url sepolia --account deployer --broadcast --verify
+forge script script/<Script>.s.sol --rpc-url <rpc-url> --account deployer --broadcast
 ```
