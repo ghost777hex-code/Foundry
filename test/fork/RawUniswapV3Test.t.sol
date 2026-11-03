@@ -39,31 +39,6 @@ contract UniswapV3ManipulateTest is MainnetForkTest, IUniswapV3SwapCallback {
         vm.label(token1, "WETH");
     }
 
-    /// @inheritdoc IUniswapV3SwapCallback
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external override {
-        if (msg.sender != address(pool)) revert();
-        if (amount0Delta > 0) IERC20(token0).transfer(msg.sender, uint256(amount0Delta));
-        if (amount1Delta > 0) IERC20(token1).transfer(msg.sender, uint256(amount1Delta));
-    }
-
-    // -------------------------------------------------------------------------------------------
-    // SOLUTION — move getV3SqrtPrice to a 3x difference from the start, minimizing TIME first,
-    // then CAPITAL.
-    //
-    // Observed behaviour of the oracle (verified empirically on the fork):
-    //   getV3SqrtPrice == min(spot, shortTWAP(180s), longTWAP(1800s)).
-    //
-    //   * Pushing the price UP: a single swap lifts ONLY spot; the two stale TWAPs still pin the
-    //     min() at the old value, so the oracle output does NOT move. Driving the output up 3x
-    //     would require SUSTAINING a sqrt-9x price across the whole 1800s long window (slow, and
-    //     enormous capital). This is the expensive direction.
-    //
-    //   * Pushing the price DOWN: min() instantly picks up the crashed spot, so the oracle output
-    //     collapses in the SAME block. A "3x difference" (output -> start/3) is therefore reached
-    //     with ONE swap, in ONE transaction, no time elapsed.
-    //
-    // Time-minimal => go DOWN. Then capital-minimal => stop spot exactly at start/3 (not lower),
-    // which is what a swap with sqrtPriceLimitX96 = start/3 does: it consumes the least token0.
     function test_Solution_Down3x_SingleBlock() public {
         uint160 startOut = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
         (, int24 startTick,,,,,) = pool.slot0();
