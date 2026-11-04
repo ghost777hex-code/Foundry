@@ -185,6 +185,12 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
     address public immutable factory;
     address public immutable positionManager;
 
+    /// @dev Authorization guard for swap/mint callbacks. Set to the pool this router is
+    /// actively calling, and cleared immediately after. A callback is only honored when
+    /// `msg.sender == _activePool`, which proves the router itself initiated the interaction.
+    /// Lives in transient storage (EIP-1153): auto-zeroed at end of the transaction, cheap to set.
+    address transient _activePool;
+
     struct ExactInputParams {
         bytes path;
         address recipient;
@@ -248,7 +254,10 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
         amountOut = params.amountIn;
         bytes memory path = params.path;
 
-        address payer = params.data;
+        // SECURITY: the first hop is always paid by the caller. Never trust a caller-supplied
+        // `payer` (params.data) — doing so lets anyone spend another account's approval to this
+        // router. params.data is intentionally ignored.
+        address payer = msg.sender;
         while (true) {
             bool hasMultiple = Path.hasMultiplePools(path);
             address pool = Path.getFirstPool(path, factory);
@@ -298,8 +307,11 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
     }
 
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        address payer = abi.decode(data, (address));
         address pool = msg.sender;
+        // SECURITY: only accept callbacks for a swap this router is actively performing.
+        // Blocks an attacker from calling a real pool directly and naming this router as payer.
+        require(pool == _activePool, "UNEXPECTED_CALLBACK");
+        address payer = abi.decode(data, (address));
         _verifyFactoryPool(pool);
 
         if (amount0Delta > 0) {
@@ -327,8 +339,10 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
 
         uint160 sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1;
 
+        _activePool = pool; // authorize the callback that `swap` will trigger
         (int256 amount0, int256 amount1) =
             IUniswapV3Pool(pool).swap(recipient, zeroForOne, int256(amountIn), sqrtPriceLimitX96, data);
+        _activePool = address(0);
 
         amountOut = uint256(-(zeroForOne ? amount1 : amount0));
     }
@@ -350,6 +364,8 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
 
     //  Problem 2
     function uniswapV3MintCallback(uint256 amount0Owed, uint256 amount1Owed, bytes calldata data) external {
+        // SECURITY: only accept callbacks for a mint this router is actively performing.
+        require(msg.sender == _activePool, "UNEXPECTED_CALLBACK");
         _verifyFactoryPool(msg.sender); //msg.sender is pool
         address payer = abi.decode(data, (address)); // addLiquidity's msg.sender is User
         if (amount0Owed > 0) _pay(IUniswapV3Pool(msg.sender).token0(), payer, msg.sender, amount0Owed);
@@ -373,8 +389,10 @@ contract UniswapV3Router is IERC721Receiver, IUniswapV3MintCallback {
             sqrtRatioX96, sqrtRatioAX96, sqrtRatioBX96, amount0Desired, amount1Desired
         );
 
+        _activePool = pool; // authorize the mint callback
         (amount0, amount1) =
             IUniswapV3Pool(pool).mint(address(this), tickLower, tickUpper, liquidity, abi.encode(msg.sender));
+        _activePool = address(0);
         require(amount0 >= amount0Min && amount1 >= amount1Min, "Slippage");
         positions[msg.sender][keccak256(abi.encodePacked(pool, tickLower, tickUpper))] += liquidity;
     }

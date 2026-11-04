@@ -66,6 +66,7 @@ contract NewRouterTest is MainnetForkTest {
 
         vm.startPrank(attacker);
         bytes memory path = abi.encodePacked(Mainnet.USDC, uint24(500), Mainnet.WETH);
+        // The attacker tries to spend Alice's approval by naming her as `data` (payer).
         UniswapV3Router.ExactInputParams memory params = UniswapV3Router.ExactInputParams({
             path: path,
             recipient: attacker,
@@ -74,10 +75,15 @@ contract NewRouterTest is MainnetForkTest {
             amountOutMinimum: 0,
             data: alice
         });
+        // Fixed router ignores caller-supplied payer and charges msg.sender (the attacker),
+        // who has no USDC/approval, so the exploit reverts instead of draining Alice.
+        vm.expectRevert();
         uniswapV3Router.exactInput(params);
         vm.stopPrank();
-        assertEq(IERC20(Mainnet.USDC).balanceOf(alice), 0);
-        assertGt(IERC20(Mainnet.WETH).balanceOf(attacker), 0);
+
+        // Alice keeps every cent; the attacker gets nothing.
+        assertEq(IERC20(Mainnet.USDC).balanceOf(alice), usdcAmount);
+        assertEq(IERC20(Mainnet.WETH).balanceOf(attacker), 0);
         emit log_named_uint("Alice balance", IERC20(Mainnet.USDC).balanceOf(alice));
         emit log_named_uint("Attacker balance", IERC20(Mainnet.WETH).balanceOf(attacker));
     }
